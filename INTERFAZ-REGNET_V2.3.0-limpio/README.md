@@ -36,4 +36,4 @@ python app/webui/app.py
 
 ## License
 
-[Your license information here]
+MIT
