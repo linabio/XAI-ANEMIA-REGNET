@@ -1,4 +1,5 @@
 import gradio as gr
+from explainability.lime_explainer import create_anemia_explainer
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -10,16 +11,10 @@ from PIL import Image
 import socket
 import argparse
 import cv2
-# Ajustar imports para carpetas con nombres no estándar
-import sys
-sys.path.append(str(Path(__file__).parent.parent.parent / "6-utilidades/herramientas"))
-sys.path.append(str(Path(__file__).parent.parent.parent / "6-utilidades/modelos"))
-from anemia_explainer import create_anemia_explainer
-from unet_model import segment_image_with_unet, apply_segmentation_mask, apply_lime_to_cropped_region
+from segmentation.unet import segment_image_with_unet, apply_segmentation_mask
 
-# Configurar las rutas de los modelos desde variables de entorno
-MODEL_PATH = os.getenv("ANEMIA_MODEL_PATH", str(Path(__file__).parent.parent.parent / "3-entrenamiento/modelos-guardados/mejor-modelo/best_regnet_anemia_classifier.pth"))
-UNET_MODEL_PATH = os.getenv("UNET_MODEL_PATH", str(Path(__file__).parent.parent.parent / "3-entrenamiento/modelos-guardados/mejor-modelo/best_unet_model.pth"))
+MODEL_PATH = os.getenv("ANEMIA_MODEL_PATH", "classification/best_regnet_anemia_classifier.pth")
+UNET_MODEL_PATH = os.getenv("UNET_MODEL_PATH", "segmentation/best_unet_model.pth")
 
 def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentation, 
                   post_process_unet, min_area_ratio, kernel_size, remove_small_components, expand_borders):
@@ -33,19 +28,16 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
             image.save(temp_file.name)
             temp_image_path = temp_file.name
 
-        # Paso 1: Segmentación con U-Net (si está habilitada)
         segmented_image_path = temp_image_path
-        mask = None  # Inicializar mask
+        mask = None  
         
         if use_unet_segmentation:
             yield None, "", "🔍 Segmentando imagen con U-Net..."
             
-            # Verificar si existe el modelo U-Net
             if not os.path.exists(UNET_MODEL_PATH):
                 yield None, "❌ Modelo U-Net no encontrado", f"Error: Modelo U-Net no encontrado en {UNET_MODEL_PATH}"
                 return
             
-            # Realizar segmentación con post-procesamiento
             result = segment_image_with_unet(
                 temp_image_path, 
                 UNET_MODEL_PATH, 
@@ -60,10 +52,8 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
                 yield None, "❌ Error en segmentación U-Net", "Error: Fallo en segmentación"
                 return
             
-            # Extraer imagen segmentada y máscara del resultado
             segmented_image, mask = result
             
-            # Guardar imagen segmentada temporalmente
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as seg_temp_file:
                 segmented_image_pil = Image.fromarray(segmented_image.astype(np.uint8))
                 segmented_image_pil.save(seg_temp_file.name)
@@ -71,7 +61,6 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
             
             status = f"✅ Segmentación U-Net completada. Usando {'GPU' if device == 'cuda' else 'CPU'}"
 
-        # Paso 2: Análisis LIME en región recortada
         yield None, "", "🔄 Ejecutando análisis LIME..."
         
         explainer = create_anemia_explainer(
@@ -81,44 +70,42 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
             num_features=num_features
         )
 
-        # Cargar imagen original para recorte
         original_img = np.array(Image.open(temp_image_path))
         
-        # Aplicar LIME solo a la región segmentada recortada
+        from segmentation.unet import apply_lime_to_cropped_region
+        
         if use_unet_segmentation and mask is not None:
-            # Usar segmentación U-Net
             result = apply_lime_to_cropped_region(
                 segmented_image=segmented_image,
                 mask=mask,
                 explainer=explainer
             )
         else:
-            # Sin segmentación U-Net, usar la imagen completa
             result = explainer.explain_single_image(
                 image_path=temp_image_path,
                 save_path=None,
                 show_plot=False
             )
-            # Agregar máscaras si no existen
+            
             if result and 'explanation' in result and result['explanation'] is not None:
                 explanation = result['explanation']
                 try:
-                    # Obtener máscara positiva
                     _, mask_pos = explanation.get_image_and_mask(
                         explanation.top_labels[0],
                         positive_only=True,
                         num_features=num_features,
                         hide_rest=False
                     )
-                    # Obtener máscara completa
+                    
                     _, mask_all = explanation.get_image_and_mask(
                         explanation.top_labels[0],
                         positive_only=False,
                         num_features=num_features,
                         hide_rest=False
                     )
-                    # Máscara negativa es la diferencia
+                    
                     mask_neg = (mask_all & ~mask_pos).astype(bool)
+                    
                     result['mask_positive'] = mask_pos
                     result['mask_negative'] = mask_neg
                 except Exception as e:
@@ -126,7 +113,6 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
                     result['mask_positive'] = np.zeros(original_img.shape[:2], dtype=bool)
                     result['mask_negative'] = np.zeros(original_img.shape[:2], dtype=bool)
             else:
-                # Si no hay explicación, crear resultado básico
                 result = {
                     'image': original_img,
                     'mask_positive': np.zeros(original_img.shape[:2], dtype=bool),
@@ -135,36 +121,29 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
                     'error': 'No se pudo generar explicación'
                 }
 
-        # Usar directamente la imagen de explicación LIME
-        lime_image = result['image']  # Esta es la imagen con la explicación LIME
+        lime_image = result['image']  
         mask_positive = result.get('mask_positive', np.zeros(result['image'].shape[:2], dtype=bool))
         mask_negative = result.get('mask_negative', np.zeros(result['image'].shape[:2], dtype=bool))
         
-        # Crear la imagen con colores diferenciados para positivo y negativo
         from skimage.segmentation import mark_boundaries
         import matplotlib.patches as mpatches
         
-        # Obtener imagen original para referencia de tamaño
         original_img = np.array(Image.open(temp_image_path))
-        original_size = (original_img.shape[1], original_img.shape[0])  # (width, height)
+        original_size = (original_img.shape[1], original_img.shape[0]) 
         
-        # Redimensionar imagen LIME al tamaño original si es necesario
         if lime_image.shape[:2] != original_img.shape[:2]:
             print(f"🔧 Redimensionando imagen LIME de {lime_image.shape[:2]} a {original_img.shape[:2]}")
             lime_image = cv2.resize(lime_image, original_size)
             mask_positive = cv2.resize(mask_positive.astype(np.float32), original_size) > 0.5
             mask_negative = cv2.resize(mask_negative.astype(np.float32), original_size) > 0.5
         
-        # Crear figura con subplots (ajustar según si se usó segmentación)
         if use_unet_segmentation:
             fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(24, 6))
             
-            # Imagen original
             ax1.imshow(original_img)
             ax1.set_title('📷 Imagen Original', fontsize=14, fontweight='bold')
             ax1.axis('off')
             
-            # Imagen segmentada (si se usó U-Net)
             if use_unet_segmentation and segmented_image_path != temp_image_path:
                 segmented_img = np.array(Image.open(segmented_image_path))
                 ax2.imshow(segmented_img)
@@ -175,7 +154,6 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
                 ax2.set_title('🎯 Sin Segmentación', fontsize=14, fontweight='bold')
                 ax2.axis('off')
             
-            # Región recortada (nueva)
             if 'bbox' in result:
                 bbox = result['bbox']
                 cropped_region = original_img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
@@ -187,25 +165,21 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
                 ax3.set_title('✂️ Sin Recorte', fontsize=14, fontweight='bold')
                 ax3.axis('off')
             
-            # Explicación LIME (ahora con el mismo tamaño)
             ax4.imshow(lime_image)
             
-            # Superponer regiones positivas en verde
             if mask_positive is not None and mask_positive.any():
                 positive_overlay = np.zeros_like(lime_image)
-                positive_overlay[mask_positive] = [0, 1, 0]  # Verde
+                positive_overlay[mask_positive] = [0, 1, 0]  
                 ax4.imshow(positive_overlay, alpha=0.3)
             
-            # Superponer regiones negativas en rojo
             if mask_negative is not None and mask_negative.any():
                 negative_overlay = np.zeros_like(lime_image)
-                negative_overlay[mask_negative] = [1, 0, 0]  # Rojo
+                negative_overlay[mask_negative] = [1, 0, 0]  
                 ax4.imshow(negative_overlay, alpha=0.3)
             
             ax4.set_title('🔍 Explicación LIME', fontsize=14, fontweight='bold')
             ax4.axis('off')
             
-            # Leyenda
             legend_elements = []
             if mask_positive is not None and mask_positive.any():
                 legend_elements.append(mpatches.Patch(color='green', alpha=0.7, label='✅ Refuerzo Positivo'))
@@ -215,19 +189,15 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
             if legend_elements:
                 ax4.legend(handles=legend_elements, loc='upper right', fontsize=10)
         else:
-            # Sin segmentación U-Net, mostrar solo 2 subplots
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
             
-            # Imagen original con regiones positivas (verde) y negativas (rojo)
             ax1.imshow(lime_image)
             
-            # Superponer regiones positivas en verde
             if mask_positive is not None and mask_positive.any():
                 positive_overlay = np.zeros_like(lime_image)
                 positive_overlay[mask_positive] = [0, 1, 0]  # Verde
                 ax1.imshow(positive_overlay, alpha=0.3)
             
-            # Superponer regiones negativas en rojo
             if mask_negative is not None and mask_negative.any():
                 negative_overlay = np.zeros_like(lime_image)
                 negative_overlay[mask_negative] = [1, 0, 0]  # Rojo
@@ -236,7 +206,6 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
             ax1.set_title('🔍 Explicación LIME con Colores', fontsize=14, fontweight='bold')
             ax1.axis('off')
             
-            # Leyenda
             legend_elements = []
             if mask_positive is not None and mask_positive.any():
                 legend_elements.append(mpatches.Patch(color='green', alpha=0.7, label='✅ Refuerzo Positivo'))
@@ -246,7 +215,6 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
             if legend_elements:
                 ax1.legend(handles=legend_elements, loc='upper right', fontsize=10)
             
-            # Imagen con límites de segmentación
             combined_mask = np.zeros(lime_image.shape[:2], dtype=bool)
             if mask_positive is not None:
                 combined_mask |= mask_positive
@@ -265,10 +233,8 @@ def analyze_anemia(image, num_samples, num_features, use_gpu, use_unet_segmentat
         img = Image.open(buf)
         plt.close(fig)
 
-        # Guardar la imagen PIL generada para depuración
         img.save("debug_gradio_output.png")
 
-        # Limpiar archivos temporales
         os.remove(temp_image_path)
         if use_unet_segmentation and segmented_image_path != temp_image_path:
             os.remove(segmented_image_path)
@@ -288,7 +254,6 @@ def show_feedback_form():
 def submit_feedback(feedback):
     return "✅ ¡Gracias por tu comentario!"
 
-# Interfaz Gradio
 with gr.Blocks(title="Anemia Analyzer") as app:
     gr.Markdown("# 🧨 Analizador de Anemia con LIME")
     gr.Markdown("Sube una imagen de la conjuntiva palpebral para detectar posibles signos de anemia. Este sistema usa IA y explicaciones visuales con LIME.")
@@ -363,15 +328,14 @@ with gr.Blocks(title="Anemia Analyzer") as app:
             diagnosis_output = gr.Textbox(label="🧪 Diagnóstico", interactive=False)
             status_output = gr.Textbox(label="📱 Estado del análisis", value="Listo para analizar", interactive=False)
 
-    # Ajustar ruta de ejemplos a nueva ubicación
-    sample_images_path = Path(__file__).parent.parent.parent / "1-datos/crudos/sample_images"
-    if sample_images_path.exists():
-        example_files = list(sample_images_path.glob("*.jpg"))
+    example_dir = Path("ui/examples") if Path("ui/examples").exists() else Path("sample_images")
+    if example_dir.exists():
+        example_files = list(example_dir.glob("*.jpg"))
         if len(example_files) >= 2:
             gr.Examples(
                 examples=[
-                    [str(sample_images_path / "normal.jpg"), 1000, 5, True, True, True, 0.001, 3, True, 5],
-                    [str(sample_images_path / "anemic.jpg"), 800, 6, False, True, True, 0.001, 3, True, 5]
+                    [str(example_dir / "normal.jpg"), 1000, 5, True, True, True, 0.001, 3, True, 5],
+                    [str(example_dir / "anemic.jpg"), 800, 6, False, True, True, 0.001, 3, True, 5]
                 ],
                 inputs=[image_input, num_samples, num_features, use_gpu, use_unet_segmentation, 
                        post_process_unet, min_area_ratio, kernel_size, remove_small_components, expand_borders],
@@ -401,7 +365,6 @@ with gr.Blocks(title="Anemia Analyzer") as app:
         outputs=[image_output, diagnosis_output, status_output]
     )
 
-# Lanzar la aplicación en puerto libre
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
@@ -414,7 +377,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     port = args.port or find_free_port()
 
-    sample_images_path = str(Path(__file__).parent.parent.parent / "1-datos/crudos/sample_images")
     print(f"🌐 Aplicación ejecutándose en: http://localhost:{port}")
     app.launch(
         server_name="127.0.0.1",
@@ -422,7 +384,5 @@ if __name__ == "__main__":
         share=True,
         show_error=True,
         inbrowser=True,
-        auth=("1", "1"),
-        allowed_paths=[sample_images_path]
+        auth=("1", "1")
     )
-

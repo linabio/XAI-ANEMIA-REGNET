@@ -14,8 +14,8 @@ import psutil
 import os
 import gc
 from contextlib import contextmanager
-from .model import BaseModel, RegNetBinaryClassifier
-from .image_processor import ImageProcessor
+from classification.regnet import BaseModel, RegNetBinaryClassifier
+from preprocess.image_processor import ImageProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,6 @@ class ExplanationConfig:
     log_performance_metrics: bool = True
 
 class PerformanceMonitor:
-    """Monitor for tracking performance metrics during LIME explanations."""
     
     def __init__(self, enable_gpu_monitoring: bool = True):
         self.enable_gpu_monitoring = enable_gpu_monitoring
@@ -60,21 +59,18 @@ class PerformanceMonitor:
         self._peak_memory = 0
         
     def _get_memory_usage_mb(self) -> float:
-        """Get current memory usage in MB."""
         try:
             return self.process.memory_info().rss / 1024 / 1024
         except:
             return 0.0
     
     def _get_cpu_usage_percent(self) -> float:
-        """Get current CPU usage percentage."""
         try:
             return self.process.cpu_percent()
         except:
             return 0.0
     
     def _get_gpu_memory_mb(self) -> Optional[float]:
-        """Get GPU memory usage in MB if available."""
         if not self.enable_gpu_monitoring:
             return None
         try:
@@ -85,25 +81,21 @@ class PerformanceMonitor:
         return None
     
     def start_monitoring(self):
-        """Start monitoring and record initial state."""
         self._initial_memory = self._get_memory_usage_mb()
         self._peak_memory = self._initial_memory
         self._start_time = time.time()
         self._start_cpu = self._get_cpu_usage_percent()
         
-        # Force garbage collection before starting
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     
     def update_peak_memory(self):
-        """Update peak memory usage."""
         current_memory = self._get_memory_usage_mb()
         if current_memory > self._peak_memory:
             self._peak_memory = current_memory
     
     def get_metrics(self, **kwargs) -> PerformanceMetrics:
-        """Get current performance metrics."""
         self.update_peak_memory()
         
         end_time = time.time()
@@ -112,7 +104,6 @@ class PerformanceMonitor:
         current_memory = self._get_memory_usage_mb()
         memory_usage = current_memory - self._initial_memory if self._initial_memory else current_memory
         
-        # Calculate average CPU usage (simplified)
         current_cpu = self._get_cpu_usage_percent()
         cpu_usage = (self._start_cpu + current_cpu) / 2
         
@@ -128,7 +119,6 @@ class PerformanceMonitor:
         )
     
     def log_metrics(self, metrics: PerformanceMetrics, operation: str = "LIME Explanation"):
-        """Log performance metrics."""
         logger.info(f"=== {operation} Performance Metrics ===")
         logger.info(f"Processing Time: {metrics.processing_time:.3f} seconds")
         logger.info(f"Memory Usage: {metrics.memory_usage_mb:.2f} MB")
@@ -148,7 +138,6 @@ class PerformanceMonitor:
 
 @contextmanager
 def performance_monitor(monitor: PerformanceMonitor, operation: str = "Operation"):
-    """Context manager for performance monitoring."""
     monitor.start_monitoring()
     try:
         yield monitor
@@ -162,7 +151,6 @@ class LimeExplainer:
                  device: str = 'cpu',
                  config: Optional[ExplanationConfig] = None,
                  class_names: Optional[List[str]] = None):
-        """Initialize the LimeExplainer with a model and configuration."""
         self.model = model
         self.device = device
         self.config = config or ExplanationConfig()
@@ -172,7 +160,6 @@ class LimeExplainer:
         self.model.eval()
         self._prediction_cache = {}
         
-        # Initialize performance monitor
         self.performance_monitor = PerformanceMonitor(enable_gpu_monitoring='cuda' in device)
         self.performance_history = []
         
@@ -192,19 +179,17 @@ class LimeExplainer:
                 if 'cuda' in self.device:
                     torch.cuda.empty_cache()
                 
-                # Record metrics
                 metrics = monitor.get_metrics(batch_size=len(images))
                 if self.config.log_performance_metrics:
                     monitor.log_metrics(metrics, "Batch Prediction")
                 self.performance_history.append(metrics)
                 
-                return probs  # Shape: (batch_size, num_classes)
+                return probs  
         except Exception as e:
             logger.exception("Batch predict error")
             raise ExplanationError("Prediction failed") from e
 
     def _cached_predict(self, images: np.ndarray, image_ids: Optional[List[str]] = None) -> np.ndarray:
-        """Predict with caching using image IDs or MD5 hashes."""
         if image_ids is None:
             hashes = [hashlib.md5(img.tobytes()).hexdigest() for img in images]
         else:
@@ -237,7 +222,6 @@ class LimeExplainer:
                       return_explanation: bool = False,
                       num_samples: Optional[int] = None,
                       num_features: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        """Explain an image using LIME with customizable parameters."""
         try:
             num_samples = num_samples or self.config.num_samples
             num_features = num_features or self.config.num_features
@@ -256,17 +240,15 @@ class LimeExplainer:
             logger.info("Generating LIME explanation...")
             image_uint8 = (image / 255).astype(np.uint8) if image.max() > 1 else image
 
-            # Monitor performance during LIME explanation
             with performance_monitor(self.performance_monitor, "LIME Explanation") as monitor:
                 explanation = self.explainer.explain_instance(
                     image=image_uint8,
                     classifier_fn=self._cached_predict,
-                    top_labels=1,  # Fixed: use integer instead of model.num_classes
+                    top_labels=1, 
                     hide_color=self.config.hide_color,
                     num_samples=num_samples
                 )
 
-                # Get the top label safely
                 top_label = getattr(explanation, 'top_labels', [0])[0] if hasattr(explanation, 'top_labels') else 0
                 
                 temp, mask = explanation.get_image_and_mask(
@@ -279,7 +261,6 @@ class LimeExplainer:
                 if show_plot or save_path:
                     self._visualize_explanation(temp, mask, explanation, save_path, show_plot)
 
-                # Get performance metrics
                 metrics = monitor.get_metrics(
                     image_size=image.shape[:2],
                     num_samples=num_samples,
@@ -290,7 +271,6 @@ class LimeExplainer:
                     monitor.log_metrics(metrics, "LIME Explanation")
                 self.performance_history.append(metrics)
 
-                # Get the top label safely for result
                 predicted_class = getattr(explanation, 'top_labels', [0])[0] if hasattr(explanation, 'top_labels') else 0
 
             result = {
@@ -348,7 +328,6 @@ class LimeExplainer:
             image_uint8 = (temp / 255).astype(np.uint8) if temp.max() > 1 else temp
             plt.imshow(image_uint8)
 
-            # Get the top label safely for visualization
             top_label = getattr(explanation, 'top_labels', [0])[0] if hasattr(explanation, 'top_labels') else 0
 
             mask_pos = explanation.get_image_and_mask(
@@ -419,7 +398,6 @@ class LimeExplainer:
         if not self.performance_history:
             return {"error": "No performance data available"}
         
-        # Calculate statistics
         processing_times = [m.processing_time for m in self.performance_history]
         memory_usages = [m.memory_usage_mb for m in self.performance_history]
         cpu_usages = [m.cpu_usage_percent for m in self.performance_history]
@@ -457,10 +435,8 @@ class LimeExplainer:
                 "max_mb": np.max(gpu_memories)
             }
         
-        # Add operation breakdown
         operation_counts = {}
         for metrics in self.performance_history:
-            # Use a default operation type since we don't track this specifically
             op_type = 'lime_operation'
             operation_counts[op_type] = operation_counts.get(op_type, 0) + 1
         
@@ -513,6 +489,7 @@ class LimeExplainer:
         """Get the most recent performance metrics."""
         return self.performance_history[-1] if self.performance_history else None
 
+
 def create_anemia_explainer(weights_path: str,
                             device: Optional[str] = None,
                             num_samples: int = 1000,
@@ -533,7 +510,6 @@ def create_anemia_explainer(weights_path: str,
                 show_plot=show_plot,
                 return_explanation=True
             )
-            # Asegurar que devolvemos un diccionario con la información estructurada
             if result is None:
                 return {
                     'error': 'No se pudo generar explicación',

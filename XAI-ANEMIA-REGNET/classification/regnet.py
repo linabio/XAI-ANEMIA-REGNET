@@ -93,7 +93,7 @@ class RegNetBinaryClassifier(BaseModel):
             x = self.backbone.trunk_output(x)
             x = self.pool(x).flatten(1)
             x = self.classifier(x)
-            return x  # No squeeze for multiclass
+            return x  
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
         """Predict class probabilities."""
